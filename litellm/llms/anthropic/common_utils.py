@@ -28,7 +28,7 @@ from litellm.constants import (
     DEFAULT_REASONING_EFFORT_XHIGH_THINKING_BUDGET,
 )
 from litellm.exceptions import UnsupportedParamsError
-from litellm.litellm_core_utils.core_helpers import as_str_mapping, lax_bool
+from litellm.litellm_core_utils.core_helpers import as_object_list, as_str_mapping, lax_bool
 from litellm.litellm_core_utils.prompt_templates.factory import THOUGHT_SIGNATURE_SEPARATOR
 from litellm.litellm_core_utils.prompt_templates.file_id_utils import (
     get_file_ids_from_messages,
@@ -41,6 +41,8 @@ from litellm.litellm_core_utils.prompt_templates.mid_conversation_system import 
 )
 from litellm.litellm_core_utils.prompt_templates.reasoning_utils import (
     is_encrypted_reasoning_block,
+    is_gemini_thought_signature_block,
+    is_unsignable_thinking_block,
     native_redacted_thinking_data,
 )
 from litellm.litellm_core_utils.reasoning_effort_utils import DroppedThinkingBudget, non_numeric_thinking_budget_error
@@ -2147,15 +2149,54 @@ def strip_thinking_blocks_from_anthropic_messages(messages: Sequence[object]) ->
     return out
 
 
-def _replayable_message(message: dict) -> dict | None:  # mutable-ok: Anthropic message payload shape
-    if not isinstance(message, Mapping):
+def _is_unsigned_thinking_block(block: object) -> bool:
+    mapping: Final = as_str_mapping(block)
+    if mapping is None or mapping.get("type") != "thinking":
+        return False
+    signature: Final = mapping.get("signature")
+    return not (isinstance(signature, str) and len(signature) > 0)
+
+
+def _should_drop_bridge_block(
+    block: object,
+    *,
+    keep_encrypted_reasoning: bool,
+    keep_gemini_thought_signatures: bool,
+    drop_unsigned_gemini_thinking: bool,
+) -> bool:
+    if is_encrypted_reasoning_block(block):
+        return not keep_encrypted_reasoning
+    if is_gemini_thought_signature_block(block):
+        return not keep_gemini_thought_signatures
+    return drop_unsigned_gemini_thinking and _is_unsigned_thinking_block(block)
+
+
+def _replayable_message(
+    message: Mapping[str, object],
+    *,
+    keep_encrypted_reasoning: bool = False,
+    keep_gemini_thought_signatures: bool = False,
+) -> dict[str, object] | None:  # mutable-ok: Anthropic message payload shape
+    if not isinstance(message, Mapping):  # pyright: ignore[reportUnnecessaryIsInstance]  # untrusted caller payloads
         return message
-    content: Final = message.get("content")
-    if not isinstance(content, list):
-        return message
-    kept: Final = [_with_native_redacted_data(b) for b in content if not is_encrypted_reasoning_block(b)]
+    content: Final = as_object_list(message.get("content"))
+    if content is None:
+        return dict(message) if not isinstance(message, dict) else message
+    drop_unsigned_gemini_thinking: Final = not keep_gemini_thought_signatures and any(
+        is_gemini_thought_signature_block(b) for b in content
+    )
+    kept: Final = [
+        _with_native_redacted_data(b)
+        for b in content
+        if not _should_drop_bridge_block(
+            b,
+            keep_encrypted_reasoning=keep_encrypted_reasoning,
+            keep_gemini_thought_signatures=keep_gemini_thought_signatures,
+            drop_unsigned_gemini_thinking=drop_unsigned_gemini_thinking,
+        )
+    ]
     if kept == content:
-        return message
+        return dict(message) if not isinstance(message, dict) else message
     if not kept:
         return None
     return {**message, "content": kept}
@@ -2175,16 +2216,56 @@ def _with_native_redacted_data(block: object) -> object:
 
 
 def strip_encrypted_reasoning_blocks_from_anthropic_messages(
-    messages: Sequence[dict],  # mutable-ok: Anthropic message payload shape
-) -> list[dict]:  # mutable-ok: AnthropicMessagesRequest.messages is typed list[dict]
+    messages: Sequence[Mapping[str, object]],
+    *,
+    keep_encrypted_reasoning: bool = False,
+    keep_gemini_thought_signatures: bool = False,
+) -> list[dict[str, object]]:  # mutable-ok: AnthropicMessagesRequest.messages is typed list[dict]
     """
-    Drop thinking / redacted_thinking blocks that carry another provider's encrypted
-    reasoning (a turn the Responses API bridge served) before the request reaches
-    Anthropic, which cannot verify them. Anthropic's own signed blocks are kept, with a
-    redacted block's Bedrock Converse-wrapped `data` unwrapped back to Claude's own.
+    Drop thinking / redacted_thinking blocks that carry another provider's bridge
+    reasoning (Responses API encrypted reasoning or Gemini `thoughtSignature`) before
+    the request reaches an incompatible backend. Anthropic's own signed blocks are kept,
+    with a redacted block's Bedrock Converse-wrapped `data` unwrapped back to Claude's own.
     """
-    stripped: Final = (_replayable_message(m) for m in messages)
+    stripped: Final = (
+        _replayable_message(
+            m,
+            keep_encrypted_reasoning=keep_encrypted_reasoning,
+            keep_gemini_thought_signatures=keep_gemini_thought_signatures,
+        )
+        for m in messages
+    )
     return [m for m in stripped if m is not None]
+
+
+def _without_unsignable_thinking(
+    message: dict[str, object],  # mutable-ok: AnthropicMessagesRequest.messages is typed list[dict]
+) -> dict[str, object] | None:  # mutable-ok: AnthropicMessagesRequest.messages is typed list[dict]
+    fields: Final = as_str_mapping(message)
+    content: Final = as_object_list(fields.get("content")) if fields is not None else None
+    if content is None:
+        return message
+    kept: Final = [block for block in content if not is_unsignable_thinking_block(block)]
+    if len(kept) == len(content):
+        return message
+    return {**message, "content": kept} if kept else None
+
+
+def strip_unsignable_thinking_blocks_for_claude(
+    messages: list[dict[str, object]],  # mutable-ok: AnthropicMessagesRequest.messages is typed list[dict]
+    model: str,
+    base_model: str | None = None,
+) -> list[dict[str, object]]:  # mutable-ok: AnthropicMessagesRequest.messages is typed list[dict]
+    """
+    Drop thinking blocks Claude cannot verify (no signature, or another provider's
+    encrypted reasoning) before /v1/messages sends the request to a Claude model on
+    the native or chat adapter route, since Claude answers 400 to them, a pending
+    tool turn included. Other targets (DeepSeek, MiniMax, GLM) need their unsigned
+    reasoning replayed.
+    """
+    if not any("claude" in name.lower() for name in (model, base_model or "")):
+        return messages
+    return [m for m in map(_without_unsignable_thinking, messages) if m is not None]
 
 
 def strip_thinking_blocks_from_anthropic_messages_request_dict(

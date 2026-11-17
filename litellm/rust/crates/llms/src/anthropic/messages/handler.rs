@@ -3,7 +3,7 @@ use litellm_llms_types::{
         AdaptiveThinking, EnabledThinking, Message, MessagesOptionalParams, MessagesRequest,
         ThinkingConfig, ThinkingDisplay,
     },
-    recognized::{Recognized, map_known_runs},
+    recognized::Recognized,
 };
 use serde_json::{Value, json};
 
@@ -12,33 +12,29 @@ use crate::{
     anthropic::common_utils::{
         flatten_unencrypted_raw_web_search_results, flatten_unencrypted_web_search_results,
         map_messages, sanitize_raw_tool_use_ids, sanitize_tool_use_ids, strip_empty_content_blocks,
-        strip_empty_raw_content_blocks, strip_provider_specific_fields,
+        strip_empty_raw_content_blocks, strip_encrypted_reasoning_blocks,
+        strip_provider_specific_fields, strip_raw_encrypted_reasoning_blocks,
         strip_raw_provider_specific_fields,
     },
-    base_llm::messages::context::{MessagesShapeOptions, UnparsedMessages},
+    base_llm::messages::context::MessagesShapeOptions,
 };
 
 pub fn shape_anthropic_messages_request(
     request: MessagesRequest,
     options: MessagesShapeOptions,
 ) -> Result<MessagesRequest, Error> {
-    let messages = match (options.presanitized, options.unparsed) {
-        (true, UnparsedMessages::Read) => map_messages(
+    let messages = if options.presanitized {
+        map_messages(
             request.messages,
             strip_provider_specific_fields,
             strip_raw_provider_specific_fields,
-        ),
-        (false, UnparsedMessages::Read) => map_messages(
+        )
+    } else {
+        map_messages(
             request.messages,
             sanitize_anthropic_messages,
             sanitize_raw_anthropic_message,
-        ),
-        (true, UnparsedMessages::Skipped) => {
-            map_known_runs(request.messages, strip_provider_specific_fields)
-        }
-        (false, UnparsedMessages::Skipped) => {
-            map_known_runs(request.messages, sanitize_anthropic_messages)
-        }
+        )
     };
     Ok(MessagesRequest {
         messages,
@@ -61,12 +57,15 @@ pub fn shape_anthropic_messages_request(
 
 fn sanitize_anthropic_messages(messages: Vec<Message>) -> Vec<Message> {
     strip_provider_specific_fields(flatten_unencrypted_web_search_results(
-        sanitize_tool_use_ids(strip_empty_content_blocks(messages)),
+        sanitize_tool_use_ids(strip_empty_content_blocks(
+            strip_encrypted_reasoning_blocks(messages),
+        )),
     ))
 }
 
 fn sanitize_raw_anthropic_message(message: Value) -> Option<Value> {
-    strip_empty_raw_content_blocks(message)
+    strip_raw_encrypted_reasoning_blocks(message)
+        .and_then(strip_empty_raw_content_blocks)
         .and_then(sanitize_raw_tool_use_ids)
         .and_then(flatten_unencrypted_raw_web_search_results)
         .and_then(strip_raw_provider_specific_fields)
@@ -223,6 +222,16 @@ mod tests {
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "functions_Bash_0", "content": "ok"}]}
         ]),
     )]
+    #[case::gemini_empty_signed_carrier_strips_sibling_unsigned_thinking_before_empty_check(
+        json!([{"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "streamed thought", "signature": ""},
+            {"type": "thinking", "thinking": "", "signature": "litellm_thought_signature:EvkFCvY"},
+            {"type": "text", "text": "Answer."}
+        ]}]),
+        json!([{"role": "assistant", "content": [
+            {"type": "text", "text": "Answer."}
+        ]}]),
+    )]
     fn sanitize_anthropic_messages_cleans_replayed_history(
         #[case] history: Value,
         #[case] expected: Value,
@@ -334,7 +343,6 @@ mod tests {
             MessagesShapeOptions {
                 reasoning_auto_summary: true,
                 presanitized: false,
-                unparsed: UnparsedMessages::Skipped,
             },
         )
         .unwrap();
@@ -355,7 +363,6 @@ mod tests {
     #[rstest]
     #[case::sanitized(
         false,
-        UnparsedMessages::Read,
         json!([
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": [
@@ -365,7 +372,6 @@ mod tests {
     )]
     #[case::presanitized(
         true,
-        UnparsedMessages::Read,
         json!([
             {"role": "user", "content": "hi"},
             {"role": "user", "content": [{"type": "text", "text": 5}]},
@@ -375,33 +381,8 @@ mod tests {
             ]}
         ])
     )]
-    #[case::skipped(
-        false,
-        UnparsedMessages::Skipped,
-        json!([
-            {"role": "user", "content": "hi"},
-            {"role": "user", "content": [{"type": "text", "text": 5}]},
-            {"role": "assistant", "content": [
-                {"type": "text", "text": 5},
-                {"type": "tool_use", "id": "functions.Bash:0", "name": "Bash", "input": {}, "provider_specific_fields": {"x": 1}}
-            ]}
-        ])
-    )]
-    #[case::skipped_presanitized(
-        true,
-        UnparsedMessages::Skipped,
-        json!([
-            {"role": "user", "content": "hi"},
-            {"role": "user", "content": [{"type": "text", "text": 5}]},
-            {"role": "assistant", "content": [
-                {"type": "text", "text": 5},
-                {"type": "tool_use", "id": "functions.Bash:0", "name": "Bash", "input": {}, "provider_specific_fields": {"x": 1}}
-            ]}
-        ])
-    )]
-    fn shaping_rewrites_a_message_that_did_not_parse_only_where_unparsed_messages_are_read(
+    fn shaping_rewrites_a_message_that_did_not_parse(
         #[case] presanitized: bool,
-        #[case] unparsed: UnparsedMessages,
         #[case] expected: Value,
     ) {
         let shaped = shape_anthropic_messages_request(
@@ -416,7 +397,6 @@ mod tests {
             MessagesShapeOptions {
                 reasoning_auto_summary: false,
                 presanitized,
-                unparsed,
             },
         )
         .unwrap();
@@ -434,7 +414,6 @@ mod tests {
             MessagesShapeOptions {
                 reasoning_auto_summary: false,
                 presanitized: true,
-                unparsed: UnparsedMessages::Skipped,
             },
         )
         .unwrap();
