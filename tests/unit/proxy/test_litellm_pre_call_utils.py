@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import time
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Final
@@ -12,7 +13,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from botocore.credentials import Credentials
 from fastapi import Request
+from fastapi.routing import APIRoute
 from opentelemetry.trace import INVALID_SPAN, NonRecordingSpan, SpanContext
+from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 from starlette.datastructures import Headers
 
@@ -30,6 +33,7 @@ from litellm.constants import (
 )
 from litellm.integrations.otel.model.config import is_otel_v2_enabled
 from litellm.litellm_core_utils.core_helpers import get_litellm_metadata_from_kwargs
+from litellm.litellm_core_utils.ecb_reference_rates import EcbReferenceRates
 from litellm.litellm_core_utils.get_provider_specific_headers import (
     ProviderSpecificHeaderUtils,
 )
@@ -45,6 +49,7 @@ from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.litellm_pre_call_utils import (
     KeyAndTeamLoggingSettings,
     LiteLLMProxyRequestSetup,
+    _add_otel_traceparent_to_data,
     _apply_credential_overrides_from_model_config,
     _extract_credential_from_entry,
     _get_enforced_params,
@@ -61,12 +66,14 @@ from litellm.proxy.litellm_pre_call_utils import (
     forwarded_anthropic_oauth_token,
     get_dynamic_logging_metadata,
     get_metadata_variable_name,
+    litellm_auth_header_name,
     move_guardrails_to_metadata,
     resolve_tenant_otel_destinations,
 )
+from litellm.proxy.pricing_currency import ReferenceRateLookup
 from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
 from litellm.types.caching import LiteLLMCacheType
-from litellm.types.litellm_params import AGENTIC_LOOP_KWARG_NAMES
+from litellm.types.litellm_params import AGENTIC_LOOP_KWARG_NAMES, PROMPT_MANAGEMENT_APPLIED_FIELD
 from litellm.types.utils import CredentialItem
 from tests.unit.proxy.router_entry_point_stubs import route_entry_points_to_stubs
 
@@ -1586,6 +1593,7 @@ async def test_add_litellm_data_to_request_strips_user_control_fields():
         "routing_decision": {"cause": "forged", "routed_model": "spoofed"},
         "litellm_gateway_injected_cache": "forged-deployment-id",
         "_session_deployment_affinity_ttl": 999999,
+        "_session_deployment_affinity_conversation": "forged-conversation",
         "internal_call_origin": "autorouter_classifier",
         "_managed_background_response": True,
         "_guardrail_pipelines": [{"name": "spoofed"}],
@@ -1647,6 +1655,7 @@ async def test_add_litellm_data_to_request_strips_user_control_fields():
         "routing_decision",
         "litellm_gateway_injected_cache",
         "_session_deployment_affinity_ttl",
+        "_session_deployment_affinity_conversation",
         "internal_call_origin",
         "_managed_background_response",
         "_guardrail_pipelines",
@@ -1713,6 +1722,7 @@ async def test_key_metadata_enable_prompt_caching_promoted_to_request_root(key_v
         "logger_fn",
         "litellm_disabled_callbacks",
         *AGENTIC_LOOP_KWARG_NAMES,
+        PROMPT_MANAGEMENT_APPLIED_FIELD,
     ],
 )
 async def test_add_litellm_data_to_request_strips_callback_control_fields(
@@ -1753,6 +1763,7 @@ async def test_add_litellm_data_to_request_strips_callback_control_fields(
         "_websearch_interception_stream_options": {"include_usage": True},
         "_headroom_interception_converted_stream": True,
         "max_agentic_loops": 9999,
+        PROMPT_MANAGEMENT_APPLIED_FIELD: True,
     }
     sample_value: Final = sample_values.get(control_field, "forged")
 
@@ -6573,6 +6584,152 @@ def test_clean_headers_strips_x_api_key_when_byok_enabled_but_x_api_key_was_auth
     assert "x-api-key" not in result
 
 
+@pytest.mark.parametrize(
+    ("headers", "litellm_key_header_name", "expected"),
+    [
+        ({"x-litellm-api-key": "sk-proxy", "authorization": "Bearer sk-other"}, None, "x-litellm-api-key"),
+        ({"x-litellm-api-key": "", "x-goog-api-key": "sk-proxy"}, None, "x-goog-api-key"),
+        ({"authorization": "Bearer sk-proxy", "x-goog-api-key": "AIza-caller"}, None, "authorization"),
+        ({"authorization": "", "x-goog-api-key": "sk-proxy"}, None, "x-goog-api-key"),
+        ({"api-key": "sk-proxy", "x-api-key": "sk-ant-caller"}, None, "api-key"),
+        ({"x-api-key": "", "x-goog-api-key": "sk-proxy"}, None, "x-goog-api-key"),
+        ({"x-api-key": "sk-proxy", "x-goog-api-key": "AIza-caller"}, None, "x-api-key"),
+        ({"x-goog-api-key": "sk-proxy"}, None, "x-goog-api-key"),
+        ({"X-Goog-Api-Key": "sk-proxy"}, None, "x-goog-api-key"),
+        ({"ocp-apim-subscription-key": "sk-proxy"}, None, "ocp-apim-subscription-key"),
+        ({"X-Custom-Key": "sk-proxy", "authorization": "Bearer sk-other"}, "x-custom-key", "x-custom-key"),
+        ({"x-custom-key": "", "x-goog-api-key": "sk-proxy"}, "x-custom-key", "x-goog-api-key"),
+        ({"authorization": "Bearer sk-proxy"}, "x-custom-key", "authorization"),
+        ({"content-type": "application/json"}, None, "x-api-key"),
+    ],
+    ids=[
+        "litellm-key-beats-authorization",
+        "empty-litellm-key-skipped",
+        "authorization-beats-goog",
+        "empty-authorization-skipped",
+        "azure-beats-anthropic",
+        "empty-anthropic-skipped",
+        "anthropic-beats-goog",
+        "goog",
+        "goog-mixed-case-dict",
+        "azure-apim",
+        "custom-header-mixed-case-dict",
+        "empty-custom-header-skipped",
+        "custom-header-absent",
+        "no-auth-header",
+    ],
+)
+def test_litellm_auth_header_name_follows_user_api_key_auth_precedence(
+    headers: Mapping[str, str], litellm_key_header_name: str | None, expected: str
+) -> None:
+    assert litellm_auth_header_name(headers, litellm_key_header_name) == expected
+    assert litellm_auth_header_name(Headers(headers), litellm_key_header_name) == expected
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        (
+            {"x-goog-api-key": "sk-proxy-virtual-key", "x-cost-center": "core-platform"},
+            {"x-cost-center": "core-platform"},
+        ),
+        (
+            {"X-Goog-Api-Key": "sk-proxy-virtual-key", "x-cost-center": "core-platform"},
+            {"x-cost-center": "core-platform"},
+        ),
+        (
+            {
+                "authorization": "Bearer sk-proxy-virtual-key",
+                "x-goog-api-key": "sk-proxy-virtual-key",
+                "x-cost-center": "core-platform",
+            },
+            {"x-cost-center": "core-platform"},
+        ),
+        (
+            {
+                "x-litellm-api-key": "sk-proxy-virtual-key",
+                "x-goog-api-key": "sk-proxy-virtual-key",
+                "x-cost-center": "core-platform",
+            },
+            {"x-cost-center": "core-platform"},
+        ),
+        (
+            {
+                "x-api-key": "",
+                "x-goog-api-key": "sk-proxy-virtual-key",
+                "x-cost-center": "core-platform",
+            },
+            {"x-cost-center": "core-platform"},
+        ),
+        (
+            {"x-litellm-api-key": "sk-proxy-virtual-key", "x-goog-api-key": "AIza-caller-key"},
+            {"x-goog-api-key": "AIza-caller-key"},
+        ),
+        (
+            {"authorization": "Bearer sk-proxy-virtual-key", "x-goog-api-key": "AIza-caller-key"},
+            {"x-goog-api-key": "AIza-caller-key"},
+        ),
+        (
+            {"api-key": "sk-proxy-virtual-key", "x-goog-api-key": "AIza-caller-key"},
+            {"x-goog-api-key": "AIza-caller-key"},
+        ),
+    ],
+    ids=[
+        "goog-was-proxy-auth",
+        "goog-mixed-case-was-proxy-auth",
+        "duplicate-proxy-key-in-bearer-and-goog",
+        "duplicate-proxy-key-in-litellm-and-goog",
+        "empty-provider-header-and-goog-proxy-auth",
+        "goog-beside-litellm-key",
+        "goog-beside-bearer-proxy-key",
+        "goog-beside-azure-proxy-key",
+    ],
+)
+def test_clean_headers_byok_strips_only_the_header_used_for_proxy_auth(
+    headers: Mapping[str, str], expected: Mapping[str, str]
+) -> None:
+    assert (
+        clean_headers(
+            headers,
+            forward_llm_provider_auth_headers=True,
+            authenticated_with_header=litellm_auth_header_name(headers),
+        )
+        == expected
+    )
+    incoming: Final = Headers(headers)
+    assert (
+        clean_headers(
+            incoming,
+            forward_llm_provider_auth_headers=True,
+            authenticated_with_header=litellm_auth_header_name(incoming),
+        )
+        == expected
+    )
+
+
+def test_clean_headers_strips_authenticated_custom_header_without_litellm_key_name() -> None:
+    cleaned: Final = clean_headers(
+        {"X-Custom-Proxy-Key": "sk-proxy-virtual-key", "x-cost-center": "core-platform"},
+        forward_llm_provider_auth_headers=True,
+        authenticated_with_header="x-custom-proxy-key",
+    )
+
+    assert cleaned == {"x-cost-center": "core-platform"}
+
+
+def test_clean_headers_byok_strips_custom_litellm_key_header_named_x_api_key() -> None:
+    incoming: Final = Headers({"x-api-key": "sk-proxy-virtual-key", "authorization": "Bearer sk-ant-api03-caller"})
+
+    result: Final = clean_headers(
+        incoming,
+        litellm_key_header_name="x-api-key",
+        forward_llm_provider_auth_headers=True,
+        authenticated_with_header=litellm_auth_header_name(incoming, "x-api-key"),
+    )
+
+    assert "x-api-key" not in result
+
+
 # ---------------------------------------------------------------------------
 # Team guardrail + global policy regression tests
 # ---------------------------------------------------------------------------
@@ -7477,6 +7634,48 @@ def _make_request_mock(path: str, headers: dict) -> MagicMock:
     return request_mock
 
 
+_TRACEPARENT: Final = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+
+@pytest.mark.parametrize(
+    ("extra_headers", "forwarded"),
+    (
+        ("X-Foo: bar", "X-Foo: bar"),
+        (["X-Foo: bar"], ["X-Foo: bar"]),
+        (None, {"traceparent": _TRACEPARENT}),
+        ({"X-Kept": "yes"}, {"X-Kept": "yes", "traceparent": _TRACEPARENT}),
+        ({"traceparent": "caller-set"}, {"traceparent": "caller-set"}),
+    ),
+    ids=("string", "list", "null", "object", "caller_traceparent"),
+)
+def test_traceparent_forwarding_leaves_non_object_extra_headers_for_the_endpoint_to_check(
+    extra_headers: object, forwarded: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(litellm, "forward_traceparent_to_llm_provider", True)
+    data: Final = {"model": "decider", "extra_headers": extra_headers}
+
+    with patch("litellm.proxy.proxy_server.open_telemetry_logger", MagicMock()):
+        _add_otel_traceparent_to_data(data, request=_make_request_mock("/v1/decisions", {"traceparent": _TRACEPARENT}))
+
+    assert data["extra_headers"] == forwarded
+
+
+@pytest.mark.parametrize("extra_headers", ({}, {"X-Kept": "yes"}), ids=("empty_object", "object"))
+def test_forwarded_traceparent_shows_in_the_logged_request_body(
+    extra_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.proxy.litellm_pre_call_utils import refresh_proxy_server_request_body_snapshot
+
+    monkeypatch.setattr(litellm, "forward_traceparent_to_llm_provider", True)
+    data: Final = {"model": "decider", "extra_headers": extra_headers, "proxy_server_request": {"body": None}}
+    refresh_proxy_server_request_body_snapshot(data)
+
+    with patch("litellm.proxy.proxy_server.open_telemetry_logger", MagicMock()):
+        _add_otel_traceparent_to_data(data, request=_make_request_mock("/v1/decisions", {"traceparent": _TRACEPARENT}))
+
+    assert data["proxy_server_request"]["body"]["extra_headers"]["traceparent"] == _TRACEPARENT
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "user_agent, request_drop_params, operator_settings, expected_drop_params",
@@ -8089,6 +8288,110 @@ async def test_add_litellm_data_to_request_keeps_every_forwarded_credential_out_
     logged = json.dumps(updated["proxy_server_request"], default=repr)
     for value in secrets.values():
         assert value not in logged
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_headers", "general_settings", "expected_forwarded_auth"),
+    [
+        (
+            {"x-goog-api-key": "sk-virtual-key", "x-cost-center": "core-platform"},
+            FORWARD_PROVIDER_AUTH_HEADERS,
+            {},
+        ),
+        (
+            {"X-Goog-Api-Key": "sk-virtual-key", "x-cost-center": "core-platform"},
+            FORWARD_PROVIDER_AUTH_HEADERS,
+            {},
+        ),
+        (
+            {
+                "authorization": "Bearer sk-virtual-key",
+                "x-goog-api-key": "sk-virtual-key",
+                "x-cost-center": "core-platform",
+            },
+            FORWARD_PROVIDER_AUTH_HEADERS,
+            {},
+        ),
+        (
+            {
+                "Authorization": "Bearer sk-virtual-key",
+                "X-Goog-Api-Key": "sk-virtual-key",
+                "x-cost-center": "core-platform",
+            },
+            FORWARD_PROVIDER_AUTH_HEADERS,
+            {},
+        ),
+        (
+            {
+                "x-api-key": "",
+                "x-goog-api-key": "sk-virtual-key",
+                "x-cost-center": "core-platform",
+            },
+            FORWARD_PROVIDER_AUTH_HEADERS,
+            {},
+        ),
+        (
+            {
+                "x-litellm-api-key": "Bearer sk-virtual-key",
+                "x-goog-api-key": "AIza-caller-key",
+                "x-cost-center": "core-platform",
+            },
+            FORWARD_PROVIDER_AUTH_HEADERS,
+            {"x-goog-api-key": "AIza-caller-key"},
+        ),
+        (
+            {"x-api-key": "sk-virtual-key", "authorization": "Bearer sk-other", "x-cost-center": "core-platform"},
+            {**FORWARD_PROVIDER_AUTH_HEADERS, "litellm_key_header_name": "x-api-key"},
+            {},
+        ),
+        (
+            {
+                "x-custom-proxy-key": "sk-virtual-key",
+                "x-goog-api-key": "AIza-caller-key",
+                "x-cost-center": "core-platform",
+            },
+            {**FORWARD_PROVIDER_AUTH_HEADERS, "litellm_key_header_name": "x-custom-proxy-key"},
+            {"x-goog-api-key": "AIza-caller-key"},
+        ),
+    ],
+    ids=[
+        "goog-was-proxy-auth",
+        "goog-mixed-case-was-proxy-auth",
+        "duplicate-proxy-key-in-bearer-and-goog",
+        "duplicate-proxy-key-mixed-case",
+        "empty-higher-precedence-header",
+        "goog-beside-litellm-key",
+        "custom-litellm-key-header",
+        "custom-litellm-key-header-preserves-goog-byok",
+    ],
+)
+async def test_add_litellm_data_to_request_never_forwards_the_header_used_for_proxy_auth(
+    request_headers: Mapping[str, str],
+    general_settings: Mapping[str, object],
+    expected_forwarded_auth: Mapping[str, str],
+) -> None:
+    request_mock: Final = _make_request_mock(
+        "/v1/chat/completions", {"Content-Type": "application/json", **request_headers}
+    )
+
+    updated: Final = await add_litellm_data_to_request(
+        data={"model": "gemini-2.0-flash", "messages": [{"role": "user", "content": "hello"}]},
+        request=request_mock,
+        user_api_key_dict=UserAPIKeyAuth(api_key="hashed-key"),
+        proxy_config=MagicMock(),
+        general_settings=dict(general_settings),
+        version="test-version",
+    )
+
+    forwarded_auth: Final = {
+        name: value
+        for name, value in updated["headers"].items()
+        if name.lower() in {"x-goog-api-key", "x-api-key", "x-litellm-api-key"}
+    }
+    assert forwarded_auth == expected_forwarded_auth
+    assert updated["headers"]["x-cost-center"] == "core-platform"
+    assert "sk-virtual-key" not in str(updated.get("api_key"))
 
 
 _SERVICE_ACCOUNT_TOKEN_REFERENCE: Final = "oidc/file//var/run/secrets/kubernetes.io/serviceaccount/token"
@@ -9468,6 +9771,129 @@ async def test_add_litellm_data_to_request_strips_router_reserved_stamps_despite
     assert "request_retry_count" not in updated["metadata"]
 
 
+def _eur_rates() -> ReferenceRateLookup:
+    def now() -> datetime:
+        return datetime(2026, 11, 13, 16, tzinfo=timezone.utc)
+
+    async def fetch() -> bytes:
+        return (
+            "<gesmes:Envelope xmlns:gesmes='http://www.gesmes.org/xml/2002-08-01'"
+            " xmlns='http://www.ecb.int/vocabulary/2002-08-01/eurofxref'><Cube><Cube time='2026-11-13'>"
+            "<Cube currency='USD' rate='1.25'/></Cube></Cube></gesmes:Envelope>"
+        ).encode()
+
+    return ReferenceRateLookup(EcbReferenceRates(clock=now), fetch)
+
+
+@pytest.mark.parametrize(
+    ("key_metadata", "body", "expected"),
+    [
+        pytest.param(
+            {"allow_client_pricing_override": True},
+            {"pricing_currency": "EUR", "input_cost_per_token": 0.5},
+            {"input_cost_per_token": 0.625},
+            id="trusted-eur-input-only",
+        ),
+        pytest.param(
+            {"allow_client_pricing_override": True},
+            {"input_cost_per_token": 0.5, "output_cost_per_token": 0.25},
+            {"input_cost_per_token": 0.5, "output_cost_per_token": 0.25},
+            id="trusted-omitted-currency-stays-usd",
+        ),
+        pytest.param(
+            {"allow_client_pricing_override": True},
+            {"pricing_currency": None, "input_cost_per_token": 0.5, "output_cost_per_token": 0.25},
+            {"input_cost_per_token": 0.5, "output_cost_per_token": 0.25},
+            id="trusted-null-currency-stays-usd",
+        ),
+        pytest.param({}, {"pricing_currency": "EUR", "input_cost_per_token": 0.5}, {}, id="untrusted-stripped"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_prices_chat_completions_in_usd_only_for_trusted_keys(
+    key_metadata: Mapping[str, object], body: Mapping[str, object], expected: Mapping[str, float]
+) -> None:
+    data: Final[dict[str, object]] = {"model": "gpt-5.4-mini", "messages": [{"role": "user", "content": "hi"}], **body}
+    updated: Final = TypeAdapter(Mapping[str, object]).validate_python(
+        await add_litellm_data_to_request(
+            data=data,
+            request=_reserved_stamp_request("/v1/chat/completions"),
+            user_api_key_dict=_reserved_stamp_key(dict(key_metadata)),
+            proxy_config=MagicMock(),
+            general_settings={},
+            version="test-version",
+            pricing_rates=_eur_rates(),
+        )
+    )
+
+    assert "pricing_currency" not in updated
+    assert {
+        field: updated[field] for field in ("input_cost_per_token", "output_cost_per_token") if field in updated
+    } == expected
+
+
+def _routed_request(template: str, path: str) -> MagicMock:
+    request: Final = _reserved_stamp_request(path)
+    request.scope = {"type": "http", "path": path, "root_path": "", "route": APIRoute(template, endpoint=lambda: None)}
+    return request
+
+
+@pytest.mark.parametrize(
+    ("template", "path"),
+    [
+        ("/v1/chat/completions", "/v1/chat/completions"),
+        ("/chat/completions", "/chat/completions"),
+        ("/engines/{model:path}/chat/completions", "/engines/gpt-5.4-mini/chat/completions"),
+        ("/openai/deployments/{model:path}/chat/completions", "/openai/deployments/gpt-5.4-mini/chat/completions"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_prices_every_chat_completions_alias_in_usd(template: str, path: str) -> None:
+    data: Final[dict[str, object]] = {
+        "model": "gpt-5.4-mini",
+        "messages": [{"role": "user", "content": "hi"}],
+        "pricing_currency": "EUR",
+        "input_cost_per_token": 0.5,
+    }
+    updated: Final = TypeAdapter(Mapping[str, object]).validate_python(
+        await add_litellm_data_to_request(
+            data=data,
+            request=_routed_request(template, path),
+            user_api_key_dict=_reserved_stamp_key({"allow_client_pricing_override": True}),
+            proxy_config=MagicMock(),
+            general_settings={},
+            version="test-version",
+            pricing_rates=_eur_rates(),
+        )
+    )
+
+    assert "pricing_currency" not in updated
+    assert updated["input_cost_per_token"] == 0.625
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_rejects_pricing_currency_outside_chat_completions() -> None:
+    data: Final[dict[str, object]] = {
+        "model": "text-embedding-3-small",
+        "input": "hi",
+        "pricing_currency": "EUR",
+        "input_cost_per_token": 0.5,
+    }
+    with pytest.raises(ProxyException) as rejected:
+        await add_litellm_data_to_request(
+            data=data,
+            request=_reserved_stamp_request("/v1/embeddings"),
+            user_api_key_dict=_reserved_stamp_key({"allow_client_pricing_override": True}),
+            proxy_config=MagicMock(),
+            general_settings={},
+            version="test-version",
+            pricing_rates=_eur_rates(),
+        )
+
+    assert rejected.value.code == "400"
+    assert rejected.value.param == "pricing_currency"
+
+
 @pytest.mark.asyncio
 async def test_add_litellm_data_to_request_strips_router_reserved_stamps_on_responses_route():
     """On the Responses family the proxy-owned bucket is litellm_metadata and the client's
@@ -10589,12 +11015,30 @@ class TestResolveUserProviderCredentials:
         )
 
         assert data["secret_fields"]["user_provider_credentials"] == {
-            "copilot-cred": {"access_token": "gho_secret", "github_host": "github.com"}
+            "copilot-cred": {"access_token": "gho_secret", "github_host": "github.com", "github_login": "octo"}
         }
         assert data["secret_fields"]["user_provider_credentials_user_id"] == "user-a"
         # the shared fallback credential is never looked up
         call_where = table.find_many.await_args.kwargs["where"]
         assert call_where == {"AND": ({"user_id": "user-a"}, {"credential_name": {"in": ["copilot-cred"]}})}
+
+    @pytest.mark.asyncio
+    async def test_failed_lookup_still_names_the_calling_user(self, monkeypatch):
+        from litellm.proxy.litellm_pre_call_utils import _resolve_user_provider_credentials_for_request
+
+        self._env(monkeypatch)
+        monkeypatch.setattr(
+            "litellm.proxy.credential_endpoints.user_provider_credentials.aget_user_provider_credentials",
+            AsyncMock(side_effect=RuntimeError("credential lookup failed")),
+        )
+        data = {"model": "copilot-chat", "secret_fields": {}}
+        await _resolve_user_provider_credentials_for_request(
+            data=data,
+            authenticated_user_id="user-a",
+            team_id=None,
+            llm_router=self._router(),
+        )
+        assert data["secret_fields"] == {"user_provider_credentials_user_id": "user-a"}, data["secret_fields"]
 
     @pytest.mark.asyncio
     async def test_service_key_cannot_override_a_per_user_credential(self, monkeypatch):
@@ -11051,7 +11495,7 @@ class TestResolveUserProviderCredentials:
             llm_router=router,
         )
         assert data["secret_fields"]["user_provider_credentials"] == {
-            "copilot-cred": {"access_token": "gho_secret", "github_host": "github.com"}
+            "copilot-cred": {"access_token": "gho_secret", "github_host": "github.com", "github_login": "octo"}
         }
         call_where: Final = table.find_many.await_args.kwargs["where"]
         assert call_where == {"AND": ({"user_id": "user-a"}, {"credential_name": {"in": ["copilot-cred"]}})}

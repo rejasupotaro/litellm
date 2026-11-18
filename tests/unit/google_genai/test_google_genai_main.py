@@ -14,6 +14,7 @@ from typing import Final, Literal
 import httpx
 import pytest
 import respx
+from google.genai import types
 from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 import litellm
@@ -399,6 +400,170 @@ async def test_vertex_generate_content_spend_follows_the_deployment_location(
     assert recorded == pytest.approx(expected), (location, stream)
 
 
+_OUTPUT_CAP_SPELLINGS: Final = (
+    {"generationConfig": {"maxOutputTokens": 16}},
+    {"generation_config": {"max_output_tokens": 16}},
+    {"generationConfig": {"max_output_tokens": 16}},
+    {"generation_config": {"maxOutputTokens": 16}},
+    {"config": types.GenerateContentConfig(max_output_tokens=16)},
+)
+_CHAT_UPSTREAM: Final = "http://upstream.test/v1"
+_CHAT_STREAM_BODY: Final = (
+    'data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"grok",'
+    '"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n'
+)
+_CHAT_BODY: Final = {
+    "id": "c",
+    "object": "chat.completion",
+    "created": 1,
+    "model": "grok",
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "length"}],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+}
+
+
+def _chat_reply(request: httpx.Request) -> httpx.Response:
+    if json.loads(request.content).get("stream"):
+        return httpx.Response(200, text=_CHAT_STREAM_BODY, headers={"content-type": "text/event-stream"})
+    return httpx.Response(200, json=_CHAT_BODY)
+
+
+@pytest.fixture
+def _httpx_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+
+
+async def _call_entrypoint(entrypoint: str, output_cap: Mapping[str, object]) -> None:
+    from litellm.google_genai.main import (
+        agenerate_content,
+        agenerate_content_stream,
+        generate_content,
+        generate_content_stream,
+    )
+
+    request: Final = {
+        "model": "hosted_vllm/grok",
+        "contents": [{"role": "user", "parts": [{"text": "Write a story"}]}],
+        "api_base": _CHAT_UPSTREAM,
+        "api_key": "k",
+        **output_cap,
+    }
+    match entrypoint:
+        case "generate_content":
+            generate_content(**request)
+        case "agenerate_content":
+            await agenerate_content(**request)
+        case "generate_content_stream":
+            generate_content_stream(**request)
+        case "agenerate_content_stream":
+            async for _ in await agenerate_content_stream(**request):
+                pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_cap", _OUTPUT_CAP_SPELLINGS)
+@pytest.mark.parametrize(
+    "entrypoint", ["generate_content", "agenerate_content", "generate_content_stream", "agenerate_content_stream"]
+)
+async def test_adapter_path_sends_the_output_cap_in_every_spelling(
+    _httpx_transport: None, entrypoint: str, output_cap: Mapping[str, object]
+) -> None:
+    with respx.mock() as upstream:
+        route: Final = upstream.post(f"{_CHAT_UPSTREAM}/chat/completions").mock(side_effect=_chat_reply)
+        await _call_entrypoint(entrypoint, output_cap)
+
+    assert json.loads(route.calls.last.request.content)["max_tokens"] == 16
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config_field", ["generationConfig", "generation_config"])
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"max_output_tokens": "16", "temperature": "0.5", "topP": "0.9"},
+        {"maxOutputTokens": 16.0, "temperature": 0.5, "top_p": 0.9},
+        {"max_output_tokens": "+16", "temperature": ".5", "top_p": "+.9"},
+    ],
+)
+async def test_adapter_path_sends_numbers_as_google_reads_them(
+    _httpx_transport: None, config_field: str, config: Mapping[str, object]
+) -> None:
+    with respx.mock() as upstream:
+        route: Final = upstream.post(f"{_CHAT_UPSTREAM}/chat/completions").mock(side_effect=_chat_reply)
+        await _call_entrypoint("agenerate_content", {config_field: config})
+
+    sent: Final = json.loads(route.calls.last.request.content)
+    assert (sent["max_tokens"], sent["temperature"], sent["top_p"]) == (16, 0.5, 0.9)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config_field", ["generationConfig", "generation_config"])
+@pytest.mark.parametrize(
+    "config",
+    [
+        "abc",
+        ["maxOutputTokens"],
+        {"max_output_tokens": "abc"},
+        {"maxOutputTokens": 16.5},
+        {"maxOutputTokens": "16.0"},
+        {"max_output_tokens": True},
+        {"temperature": True},
+        {"temperature": "1e400"},
+        {"top_p": float("inf")},
+    ],
+)
+async def test_adapter_path_rejects_an_invalid_config_before_calling_upstream(
+    _httpx_transport: None, config_field: str, config: object
+) -> None:
+    with respx.mock(assert_all_called=False) as upstream:
+        route: Final = upstream.post(f"{_CHAT_UPSTREAM}/chat/completions").mock(side_effect=_chat_reply)
+        with pytest.raises(litellm.BadRequestError):
+            await _call_entrypoint("agenerate_content", {config_field: config})
+
+    assert not route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("field", ["temperature", "max_output_tokens"])
+async def test_adapter_path_refuses_a_long_malformed_number_string_without_stalling(
+    _httpx_transport: None, field: str
+) -> None:
+    with respx.mock(assert_all_called=False) as upstream:
+        route: Final = upstream.post(f"{_CHAT_UPSTREAM}/chat/completions").mock(side_effect=_chat_reply)
+        with pytest.raises(litellm.BadRequestError):
+            await _call_entrypoint("agenerate_content", {"generation_config": {field: "1" * 50_000 + "x"}})
+
+    assert not route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_cap", _OUTPUT_CAP_SPELLINGS)
+async def test_native_gemini_request_carries_the_output_cap_in_every_spelling(
+    _httpx_transport: None, output_cap: Mapping[str, object]
+) -> None:
+    from litellm.google_genai.main import agenerate_content
+
+    with respx.mock() as upstream:
+        route: Final = upstream.post(url__startswith="https://generativelanguage.googleapis.com/").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "candidates": [{"content": {"parts": [{"text": "hi"}], "role": "model"}, "finishReason": "STOP"}],
+                    "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
+                },
+            )
+        )
+        await agenerate_content(
+            model="gemini/gemini-2.0-flash",
+            contents=[{"role": "user", "parts": [{"text": "Write a story"}]}],
+            api_key="test-key",
+            **output_cap,
+        )
+
+    assert json.loads(route.calls.last.request.content)["generationConfig"]["maxOutputTokens"] == 16
+
+
 class NativeContentLLM(CustomLLM):
     def __init__(self) -> None:
         super().__init__()
@@ -499,17 +664,30 @@ async def test_custom_native_content_preserves_images_and_config(
 
 @pytest.mark.parametrize("is_async", [False, True])
 @pytest.mark.parametrize("config", [None, {}])
+@pytest.mark.parametrize("config_field", ["config", "generationConfig", "generation_config"])
 @pytest.mark.asyncio
 async def test_custom_native_content_preserves_empty_request(
-    native_content_handler: NativeContentLLM, is_async: bool, config: object
+    native_content_handler: NativeContentLLM, is_async: bool, config: object, config_field: str
 ) -> None:
-    request: Final = dict(model="native_image_test/image-model", contents=[], config=config)
+    request: Final = {"model": "native_image_test/image-model", "contents": [], config_field: config}
     result: Final = await litellm.agenerate_content(**request) if is_async else litellm.generate_content(**request)
     assert result == native_content_handler.response
     received: Final = native_content_handler.requests[0]
     assert received["contents"] == []
     assert received["config"] == config
     assert received["tools"] is None
+
+
+@pytest.mark.parametrize("config_field", ["generationConfig", "generation_config"])
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.asyncio
+async def test_custom_native_content_receives_the_request_body_config_in_either_spelling(
+    native_content_handler: NativeContentLLM, is_async: bool, config_field: str
+) -> None:
+    config: Final = {"maxOutputTokens": 16, "seed": 17}
+    request: Final = {"model": "native_image_test/image-model", "contents": [], config_field: config}
+    _ = await litellm.agenerate_content(**request) if is_async else litellm.generate_content(**request)
+    assert native_content_handler.requests[0]["config"] == config
 
 
 @pytest.mark.parametrize("is_async", [False, True])
@@ -1126,6 +1304,41 @@ async def test_custom_content_adapter_rejects_generation_config_values_it_cannot
         _ = await litellm.agenerate_content(**request) if is_async else litellm.generate_content(**request)
 
 
+class OptionalParamsRecorderLLM(CompletionContentLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.optional_params: tuple[Mapping[str, object], ...] = ()
+
+    def completion(self, **kwargs: object) -> litellm.ModelResponse:
+        optional_params: Final = kwargs["optional_params"]
+        assert isinstance(optional_params, dict)
+        self.optional_params = (*self.optional_params, MappingProxyType(dict(optional_params)))
+        return super().completion(**kwargs)
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.asyncio
+async def test_custom_content_adapter_sends_snake_case_generation_config(
+    native_content_handler: NativeContentLLM, monkeypatch: pytest.MonkeyPatch, is_async: bool
+) -> None:
+    handler: Final = OptionalParamsRecorderLLM()
+    monkeypatch.setattr(litellm, "custom_provider_map", [{"provider": "native_image_test", "custom_handler": handler}])
+    request: Final = dict(
+        model="native_image_test/chat-model",
+        contents=[{"parts": [{"text": "hi"}]}],
+        generation_config={
+            "max_output_tokens": 16,
+            "top_p": 0.5,
+            "stop_sequences": ["zz"],
+            "candidate_count": 1,
+            "response_modalities": ["TEXT"],
+        },
+    )
+    _ = await litellm.agenerate_content(**request) if is_async else litellm.generate_content(**request)
+    (sent,) = handler.optional_params
+    assert (sent["max_tokens"], sent["top_p"], sent["stop"]) == (16, 0.5, ["zz"])
+
+
 class ResponseFormatRecorderLLM(CompletionContentLLM):
     def __init__(self) -> None:
         super().__init__()
@@ -1383,3 +1596,464 @@ async def test_ai_studio_generate_content_keeps_the_callers_labels_with_the_sett
     )
 
     assert body["labels"] == _FORGED
+
+
+class _WireCapture:
+    def __init__(self, url: str) -> None:
+        self.url: Final = url
+        self._items: Final[list[tuple[str, Mapping[str, str]]]] = []  # mutable-ok: test wire log
+
+    def record(self, path: str, headers: Mapping[str, str]) -> None:
+        self._items.append((path, headers))
+
+    @property
+    def requests(self) -> tuple[tuple[str, Mapping[str, str]], ...]:
+        return tuple(self._items)
+
+
+def _mock_wire_reply(path: str, stream_requested: bool) -> tuple[bytes, str]:
+    if "streamGenerateContent" in path:
+        return (
+            b'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"pong"}]},'
+            b'"finishReason":"STOP"}],'
+            b'"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":1,"totalTokenCount":5}}\n\n',
+            "text/event-stream",
+        )
+    if ":generateContent" in path:
+        return (
+            b'{"candidates":[{"content":{"role":"model","parts":[{"text":"pong"}]},'
+            b'"finishReason":"STOP"}],'
+            b'"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":1,"totalTokenCount":5}}',
+            "application/json",
+        )
+    if stream_requested:
+        return (
+            b'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,'
+            b'"model":"gpt-4o-mini","choices":[{"index":0,'
+            b'"delta":{"role":"assistant","content":"pong"},"finish_reason":"stop"}]}\n\n'
+            b"data: [DONE]\n\n",
+            "text/event-stream",
+        )
+    return (
+        b'{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4o-mini",'
+        b'"choices":[{"index":0,"message":{"role":"assistant","content":"pong"},'
+        b'"finish_reason":"stop"}],'
+        b'"usage":{"prompt_tokens":4,"completion_tokens":1,"total_tokens":5}}',
+        "application/json",
+    )
+
+
+@pytest.fixture
+def header_capture_wire() -> Iterator[_WireCapture]:
+    """
+    Loopback upstream that records outbound wire headers.
+
+    A real socket (allowed by ``tests/unit/conftest.py`` for loopback hosts) is used instead of
+    ``respx`` because async calls go through litellm's aiohttp transport, which ``respx`` cannot intercept.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    holder: Final[list[_WireCapture]] = []  # mutable-ok: single-slot fixture bootstrap reference
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length: Final = int(self.headers.get("Content-Length", "0"))
+            raw_body: Final = self.rfile.read(length)
+            holder[0].record(self.path, {k.lower(): v for k, v in self.headers.items()})
+            payload: Final = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+            body, content_type = _mock_wire_reply(self.path, bool(payload.get("stream")))
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server: Final = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    capture: Final = _WireCapture(f"http://127.0.0.1:{server.server_address[1]}")
+    holder.append(capture)
+    thread: Final = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield capture
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _extract_chunk_texts(payload: object) -> tuple[str, ...]:
+    from pydantic import TypeAdapter
+
+    obj_map: Final = TypeAdapter[Mapping[str, object]](Mapping[str, object])
+    map_seq: Final = TypeAdapter[tuple[Mapping[str, object], ...]](tuple[Mapping[str, object], ...])
+    parsed: Final = obj_map.validate_python(payload.model_dump() if hasattr(payload, "model_dump") else payload)
+    candidates: Final = map_seq.validate_python(parsed.get("candidates", ()))
+    if not candidates:
+        return ()
+    content: Final = obj_map.validate_python(candidates[0].get("content", {}))
+    parts: Final = map_seq.validate_python(content.get("parts", ()))
+    return tuple(str(part["text"]) for part in parts if isinstance(part.get("text"), str) and part["text"])
+
+
+def _sse_payload_texts(line: str) -> tuple[str, ...]:
+    if not line.startswith("data: "):
+        return ()
+    payload: Final = line[6:].strip()
+    if not payload or payload == "[DONE]":
+        return ()
+    return _extract_chunk_texts(json.loads(payload))
+
+
+def _extract_sse_texts(chunks: tuple[bytes, ...]) -> tuple[str, ...]:
+    from itertools import chain
+
+    lines: Final = chain.from_iterable(raw.decode("utf-8").splitlines() for raw in chunks)
+    return tuple(chain.from_iterable(_sse_payload_texts(line) for line in lines))
+
+
+_UPSTREAM_KEY: Final = "upstream-secret"
+
+
+def _target_route(target: str, wire: _WireCapture) -> tuple[str, str]:
+    if target == "native":
+        return "gemini/gemini-2.0-flash", wire.url
+    return "openai/gpt-4o-mini", f"{wire.url}/v1"
+
+
+async def _invoke_generate_content(
+    entrypoint: str,
+    *,
+    model: str,
+    api_base: str,
+    headers: Mapping[str, str],
+    extra_headers: Mapping[str, str],
+) -> tuple[str, ...]:
+    from collections.abc import AsyncIterator
+
+    from pydantic import TypeAdapter
+
+    from litellm.google_genai.main import (
+        agenerate_content,
+        agenerate_content_stream,
+        generate_content,
+        generate_content_stream,
+    )
+
+    contents: Final = [{"role": "user", "parts": [{"text": "ping"}]}]
+    if entrypoint == "sync":
+        return _extract_chunk_texts(
+            generate_content(
+                model=model,
+                contents=contents,
+                api_base=api_base,
+                api_key=_UPSTREAM_KEY,
+                headers=headers,
+                extra_headers=dict(extra_headers),
+            )
+        )
+    if entrypoint == "async":
+        return _extract_chunk_texts(
+            await agenerate_content(
+                model=model,
+                contents=contents,
+                api_base=api_base,
+                api_key=_UPSTREAM_KEY,
+                headers=headers,
+                extra_headers=dict(extra_headers),
+            )
+        )
+    stream: Final = (
+        generate_content_stream(
+            model=model,
+            contents=contents,
+            api_base=api_base,
+            api_key=_UPSTREAM_KEY,
+            headers=headers,
+            extra_headers=dict(extra_headers),
+        )
+        if entrypoint == "sync_stream"
+        else await agenerate_content_stream(
+            model=model,
+            contents=contents,
+            api_base=api_base,
+            api_key=_UPSTREAM_KEY,
+            headers=headers,
+            extra_headers=dict(extra_headers),
+        )
+    )
+    as_bytes: Final = TypeAdapter(bytes)
+    # native sync streams implement both protocols; adapter sync streams are async-only
+    if entrypoint == "sync_stream" and isinstance(stream, Iterator):
+        return _extract_sse_texts(tuple(as_bytes.validate_python(chunk) for chunk in stream))
+    assert isinstance(stream, AsyncIterator)
+    return _extract_sse_texts(tuple([as_bytes.validate_python(chunk) async for chunk in stream]))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["sync", "async", "sync_stream", "async_stream"])
+@pytest.mark.parametrize("target", ["native", "adapter"])
+async def test_generate_content_forwards_client_headers_behind_explicit_extra_headers(
+    header_capture_wire: _WireCapture,
+    target: str,
+    entrypoint: str,
+) -> None:
+    model, api_base = _target_route(target, header_capture_wire)
+    forwarded: Final = {"x-team-id": "platform", "x-custom": "from-proxy", "anthropic-beta": "context-1m-2025-08-07"}
+    explicit: Final = {"X-Custom": "from-caller"}
+
+    texts: Final = await _invoke_generate_content(
+        entrypoint, model=model, api_base=api_base, headers=forwarded, extra_headers=explicit
+    )
+
+    assert texts == ("pong",)
+    assert forwarded == {"x-team-id": "platform", "x-custom": "from-proxy", "anthropic-beta": "context-1m-2025-08-07"}
+    assert explicit == {"X-Custom": "from-caller"}
+    assert len(header_capture_wire.requests) == 1
+    wire_headers: Final = header_capture_wire.requests[0][1]
+    assert wire_headers["x-team-id"] == "platform"
+    assert wire_headers["anthropic-beta"] == "context-1m-2025-08-07"
+    assert wire_headers["x-custom"] == "from-caller"
+
+
+@pytest.mark.parametrize(
+    "extra_headers, client_headers, expected",
+    [
+        (None, None, None),
+        (None, {}, None),
+        ({}, None, {}),
+        ({"x-b": "2"}, None, {"x-b": "2"}),
+        (None, {"x-a": "1"}, {"x-a": "1"}),
+        ({}, {"x-a": "1"}, {"x-a": "1"}),
+        ({"X-Custom": "from-caller"}, {"x-custom": "from-proxy", "x-a": "1"}, {"x-a": "1", "X-Custom": "from-caller"}),
+        ({"x-b": "2"}, "not-a-mapping", {"x-b": "2"}),
+        (None, "not-a-mapping", None),
+        ({"x-b": "2"}, {"x-a": 1}, {"x-b": "2"}),
+    ],
+    ids=[
+        "nothing",
+        "empty-forwarded",
+        "empty-explicit",
+        "explicit-only",
+        "forwarded-only",
+        "empty-explicit-with-forwarded",
+        "case-insensitive-precedence",
+        "non-mapping-forwarded-kept-explicit",
+        "non-mapping-forwarded",
+        "non-str-value-forwarded",
+    ],
+)
+def test_merge_client_forwarded_headers(
+    extra_headers: Mapping[str, str] | None,
+    client_headers: object,
+    expected: Mapping[str, str] | None,
+) -> None:
+    from litellm.google_genai.main import _merge_client_forwarded_headers
+
+    merged: Final = _merge_client_forwarded_headers(extra_headers, client_headers)
+
+    assert merged == expected
+    assert merged is None or (merged is not extra_headers and merged is not client_headers)
+def test_merge_client_forwarded_headers_validation_log_omits_rejected_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    from litellm._logging import verbose_logger
+    from litellm.google_genai.main import _merge_client_forwarded_headers
+
+    with caplog.at_level(logging.DEBUG, logger=verbose_logger.name):
+        merged: Final = _merge_client_forwarded_headers(
+            {"x-b": "2"},
+            {"api-key": ["opaque-provider-secret"]},
+        )
+
+    assert merged == {"x-b": "2"}
+    assert "Ignoring invalid forwarded headers (1 validation errors)" in caplog.text
+    assert "opaque-provider-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["native", "adapter"])
+async def test_router_deployment_headers_reach_generate_content(
+    header_capture_wire: _WireCapture,
+    target: str,
+) -> None:
+    from litellm import Router
+
+    model, api_base = _target_route(target, header_capture_wire)
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "genai-deployment",
+                "litellm_params": {
+                    "model": model,
+                    "api_base": api_base,
+                    "api_key": _UPSTREAM_KEY,
+                    "headers": {"x-deployment-tag": "blue"},
+                },
+            }
+        ]
+    )
+
+    resp: Final = await router.agenerate_content(
+        model="genai-deployment",
+        contents=[{"role": "user", "parts": [{"text": "ping"}]}],
+    )
+
+    assert _extract_chunk_texts(resp) == ("pong",)
+    assert len(header_capture_wire.requests) == 1
+    assert header_capture_wire.requests[0][1]["x-deployment-tag"] == "blue"
+
+
+@pytest.mark.asyncio
+async def test_proxy_forwarded_headers_reach_generate_content_without_leaking_proxy_auth(
+    header_capture_wire: _WireCapture,
+) -> None:
+    from starlette.datastructures import Headers
+
+    from litellm.google_genai.main import agenerate_content
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.litellm_pre_call_utils import (
+        LiteLLMProxyRequestSetup,
+        clean_headers,
+        litellm_auth_header_name,
+    )
+
+    incoming_headers: Final = Headers(
+        {
+            "x-goog-api-key": "sk-litellm-virtual-key",
+            "authorization": "Bearer sk-litellm-virtual-key",
+            "x-cost-center": "core-platform",
+            "user-agent": "google-genai-sdk/1.0",
+        }
+    )
+    cleaned: Final = clean_headers(
+        incoming_headers,
+        litellm_key_header_name=None,
+        forward_llm_provider_auth_headers=False,
+        authenticated_with_header=litellm_auth_header_name(incoming_headers),
+    )
+    backend_data: Final = LiteLLMProxyRequestSetup.add_litellm_data_for_backend_llm_call(
+        headers=cleaned,
+        request_data={"model": "gemini/gemini-2.0-flash"},
+        user_api_key_dict=UserAPIKeyAuth(api_key="sk-litellm-virtual-key"),
+        general_settings={"forward_client_headers_to_llm_api": True},
+    )
+
+    resp: Final = await agenerate_content(
+        model="gemini/gemini-2.0-flash",
+        contents=[{"role": "user", "parts": [{"text": "ping"}]}],
+        api_base=header_capture_wire.url,
+        api_key=_UPSTREAM_KEY,
+        headers=backend_data.get("headers"),
+    )
+
+    assert _extract_chunk_texts(resp) == ("pong",)
+    assert len(header_capture_wire.requests) == 1
+    wire_headers: Final = header_capture_wire.requests[0][1]
+    assert wire_headers["x-goog-api-key"] == _UPSTREAM_KEY
+    assert wire_headers["x-cost-center"] == "core-platform"
+    assert "authorization" not in wire_headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("incoming", "expected_upstream_key"),
+    [
+        ({"x-goog-api-key": "sk-litellm-virtual-key", "x-cost-center": "core-platform"}, _UPSTREAM_KEY),
+        (
+            {
+                "authorization": "Bearer sk-litellm-virtual-key",
+                "x-goog-api-key": "sk-litellm-virtual-key",
+                "x-cost-center": "core-platform",
+            },
+            _UPSTREAM_KEY,
+        ),
+        (
+            {
+                "x-api-key": "",
+                "x-goog-api-key": "sk-litellm-virtual-key",
+                "x-cost-center": "core-platform",
+            },
+            _UPSTREAM_KEY,
+        ),
+        (
+            {
+                "authorization": "Bearer sk-litellm-virtual-key",
+                "x-goog-api-key": "",
+                "x-cost-center": "core-platform",
+            },
+            _UPSTREAM_KEY,
+        ),
+        (
+            {
+                "x-litellm-api-key": "sk-litellm-virtual-key",
+                "x-goog-api-key": "AIza-caller-key",
+                "x-cost-center": "core-platform",
+            },
+            "AIza-caller-key",
+        ),
+        (
+            {
+                "authorization": "Bearer sk-litellm-virtual-key",
+                "x-goog-api-key": "AIza-caller-key",
+                "x-cost-center": "core-platform",
+            },
+            "AIza-caller-key",
+        ),
+    ],
+    ids=[
+        "proxy-key-in-goog-header",
+        "sdk-dual-bearer-and-goog-proxy-key",
+        "empty-higher-precedence-header",
+        "empty-goog-header-beside-bearer-key",
+        "caller-key-beside-litellm-key",
+        "caller-key-beside-bearer-key",
+    ],
+)
+async def test_provider_auth_forwarding_never_sends_proxy_key_to_generate_content(
+    header_capture_wire: _WireCapture,
+    incoming: Mapping[str, str],
+    expected_upstream_key: str,
+) -> None:
+    from starlette.datastructures import Headers
+
+    from litellm.google_genai.main import agenerate_content
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.litellm_pre_call_utils import (
+        LiteLLMProxyRequestSetup,
+        clean_headers,
+        litellm_auth_header_name,
+    )
+
+    incoming_headers: Final = Headers(incoming)
+    cleaned: Final = clean_headers(
+        incoming_headers,
+        forward_llm_provider_auth_headers=True,
+        authenticated_with_header=litellm_auth_header_name(incoming_headers),
+    )
+    backend_data: Final = LiteLLMProxyRequestSetup.add_litellm_data_for_backend_llm_call(
+        headers=cleaned,
+        request_data={"model": "gemini/gemini-2.0-flash"},
+        user_api_key_dict=UserAPIKeyAuth(api_key="sk-litellm-virtual-key"),
+        general_settings={"forward_client_headers_to_llm_api": True},
+    )
+
+    resp: Final = await agenerate_content(
+        model="gemini/gemini-2.0-flash",
+        contents=[{"role": "user", "parts": [{"text": "ping"}]}],
+        api_base=header_capture_wire.url,
+        api_key=_UPSTREAM_KEY,
+        headers=backend_data.get("headers"),
+    )
+
+    assert _extract_chunk_texts(resp) == ("pong",)
+    assert len(header_capture_wire.requests) == 1
+    wire_headers: Final = header_capture_wire.requests[0][1]
+    assert wire_headers["x-goog-api-key"] == expected_upstream_key
+    assert wire_headers["x-cost-center"] == "core-platform"
+    assert "x-litellm-api-key" not in wire_headers
